@@ -83,6 +83,7 @@ import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
 import { discoverClaudeSkills } from "../Drivers/ClaudeSkills.ts";
+import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import {
   BUNDLED_CLAUDE_MODEL_CATALOG,
   type ClaudeModelCatalog,
@@ -624,12 +625,17 @@ function compactBoundaryTokenUsageSnapshot(
   }
 
   const preTokens = finiteNonNegativeInteger(compactMetadata.pre_tokens);
-  return makeClaudeTokenUsageSnapshot({
+  const snapshot = makeClaudeTokenUsageSnapshot({
     activeTokens: postTokens,
     ...(preTokens !== undefined ? { lastUsedTokens: preTokens } : {}),
     ...(contextWindow !== undefined ? { contextWindow } : {}),
     ...(totalProcessedTokens !== undefined ? { totalProcessedTokens } : {}),
   });
+  if (snapshot === undefined || preTokens !== undefined) {
+    return snapshot;
+  }
+  const { lastUsedTokens: _lastUsedTokens, ...snapshotWithoutBeforeTokens } = snapshot;
+  return snapshotWithoutBeforeTokens;
 }
 
 function normalizeClaudeTaskProgressTokenUsage(
@@ -3203,32 +3209,36 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           },
         });
         return;
-      case "compact_boundary":
+      case "compact_boundary": {
         if (context.turnState) {
           context.turnState.latestAssistantUsage = undefined;
           context.turnState.compactedSinceLatestAssistantUsage = true;
         }
-        yield* emitThreadTokenUsage(
-          context,
-          compactBoundaryTokenUsageSnapshot(
-            message as unknown as Record<string, unknown>,
-            context.lastKnownContextWindow,
-            context.lastKnownTotalProcessedTokens,
-          ),
-          {
-            rawMethod: "claude/system/compact_boundary",
-            rawPayload: message,
-          },
+        const compactedUsage = compactBoundaryTokenUsageSnapshot(
+          message as unknown as Record<string, unknown>,
+          context.lastKnownContextWindow,
+          context.lastKnownTotalProcessedTokens,
         );
+        yield* emitThreadTokenUsage(context, compactedUsage, {
+          rawMethod: "claude/system/compact_boundary",
+          rawPayload: message,
+        });
         yield* offerRuntimeEvent({
           ...base,
           type: "thread.state.changed",
           payload: {
             state: "compacted",
+            ...(compactedUsage?.lastUsedTokens !== undefined
+              ? { beforeTokens: compactedUsage.lastUsedTokens }
+              : {}),
+            ...(compactedUsage?.usedTokens !== undefined
+              ? { afterTokens: compactedUsage.usedTokens }
+              : {}),
             detail: message,
           },
         });
         return;
+      }
       case "hook_started":
         yield* offerRuntimeEvent({
           ...base,
@@ -3790,7 +3800,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     // Same reason as the approvals above: a request nobody can answer any more
     // must not stay open, or the thread can never be settled.
-    for (const pending of [...context.pendingUserInputs.values()]) {
+    for (const pending of context.pendingUserInputs.values()) {
       yield* pending.cancel;
     }
 
@@ -4361,7 +4371,12 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(input.cwd ? { cwd: input.cwd } : {}),
         ...(apiModelId ? { model: apiModelId } : {}),
         pathToClaudeCodeExecutable: claudeBinaryPath,
-        systemPrompt: { type: "preset", preset: "claude_code" },
+        systemPrompt: {
+          type: "preset",
+          preset: "claude_code",
+          // Model and effort can change after this session-level prompt is set.
+          append: buildRuntimeInstructions({ harness: "Claude Code" }),
+        },
         settingSources: [...CLAUDE_SETTING_SOURCES],
         // `ultracode` is a Claude Code setting, not an API effort level. It is
         // normalized to `xhigh` above and paired with `settings.ultracode`.

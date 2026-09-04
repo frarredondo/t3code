@@ -353,6 +353,33 @@ function makeThread(
 }
 
 describe("buildThreadFeed", () => {
+  it("keeps context compaction as a standalone timeline row", () => {
+    const thread = makeThread({
+      id: ThreadId.make("thread-context-compaction"),
+      projectId: ProjectId.make("project-1"),
+      title: "Context compaction",
+      activities: [
+        makeActivity({
+          id: EventId.make("context-compaction"),
+          kind: "context-compaction",
+          tone: "info",
+          summary: "Compacted context 899K → 19K tokens",
+          createdAt: "2026-09-01T00:00:00.000Z",
+          turnId: TurnId.make("turn-context-compaction"),
+        }),
+      ],
+    });
+
+    const presented = deriveThreadFeedPresentation(buildThreadFeed(thread), null, new Set());
+    expect(presented).toMatchObject([
+      {
+        type: "activity-group",
+        id: "context-compaction",
+        activities: [{ summary: "Compacted context 899K → 19K tokens" }],
+      },
+    ]);
+  });
+
   it("keeps long Claude commands expandable without repeating them in full detail", () => {
     const command = `printf 'first line\nsecond line'\n&& printf done`;
     const thread = makeThread({
@@ -1963,6 +1990,49 @@ describe("buildThreadFeed", () => {
     },
   );
 
+  it("preserves serialized shell wrappers with non-matching boundary quotes", () => {
+    const turnId = TurnId.make("turn-serialized-shell-wrapper");
+    const command =
+      "/bin/zsh -lc 'git status\nsed -n '\"'1,20p' apps/web/src/components/DiffPanel.tsx\"";
+    const thread = makeThread({
+      id: ThreadId.make("thread-serialized-shell-wrapper"),
+      projectId: ProjectId.make("project-1"),
+      title: "Serialized shell wrapper",
+      latestTurn: {
+        turnId,
+        state: "running",
+        requestedAt: "2026-04-01T00:00:00.000Z",
+        startedAt: "2026-04-01T00:00:00.000Z",
+        completedAt: null,
+        assistantMessageId: null,
+      },
+      activities: [
+        makeActivity({
+          id: EventId.make("serialized-shell-wrapper"),
+          kind: "tool.updated",
+          tone: "tool",
+          summary: "Ran command",
+          createdAt: "2026-04-01T00:00:01.000Z",
+          turnId,
+          payload: {
+            itemType: "command_execution",
+            status: "inProgress",
+            data: { item: { command } },
+          },
+        }),
+      ],
+    });
+
+    const feed = buildThreadFeed(thread);
+    expect(feed[0]).toMatchObject({
+      type: "activity-group",
+      activities: [{ workEntry: { command } }],
+    });
+    if (feed[0]?.type === "activity-group") {
+      expect(feed[0].activities[0]?.workEntry.rawCommand).toBeUndefined();
+    }
+  });
+
   it.each([
     ["inProgress", true],
     ["completed", false],
@@ -2186,9 +2256,13 @@ describe("quiet timeline: nested agents", () => {
     },
   );
 
-  it.each(["cancelled", "failed", "interrupted"] as const)(
-    "replaces Antigravity progress with %s without a timeline bypass flag",
+  it.each(["cancelled", "failed", "interrupted", "idle"] as const)(
+    "replaces Antigravity batch progress with %s",
     (status) => {
+      const detail =
+        status === "idle"
+          ? "Turn ended. Individual agent status is unavailable."
+          : "Antigravity process stopped.";
       const thread = makeThread({
         id: ThreadId.make("antigravity-agents"),
         projectId: ProjectId.make("project-1"),
@@ -2198,14 +2272,14 @@ describe("quiet timeline: nested agents", () => {
             makeActivity({
               id: EventId.make(`progress-${index}`),
               kind: "task.progress",
-              summary: "Antigravity subagent",
+              summary: "Antigravity subagent batch",
               createdAt: `2026-04-01T00:00:0${index + 1}.000Z`,
               payload: {
                 taskId,
-                taskType: "subagent",
+                taskType: "subagent_batch",
                 agentKind: "agent",
-                title: "Antigravity subagent",
-                detail: "Antigravity subagent",
+                title: "Antigravity subagent batch",
+                detail: "Antigravity subagent batch",
                 status: "running",
               },
             }),
@@ -2217,11 +2291,11 @@ describe("quiet timeline: nested agents", () => {
             createdAt: "2026-04-01T00:00:03.000Z",
             payload: {
               taskId: "trajectory:4",
-              taskType: "subagent",
+              taskType: "subagent_batch",
               agentKind: "agent",
-              title: "Antigravity subagent",
+              title: "Antigravity subagent batch",
               status,
-              error: "Antigravity process stopped.",
+              ...(status === "idle" ? { detail, timelineBypass: true } : { error: detail }),
             },
           }),
         ],
@@ -2232,8 +2306,8 @@ describe("quiet timeline: nested agents", () => {
       expect(rows).toHaveLength(2);
       expect(rows[0]).toMatchObject({
         lifecycleStatus: status === "failed" ? "failed" : "stopped",
-        detail: "Antigravity process stopped.",
-        workEntry: { taskId: "trajectory:4", toolTitle: "Antigravity subagent" },
+        detail,
+        workEntry: { taskId: "trajectory:4", toolTitle: "Antigravity subagent batch" },
       });
       expect(rows[1]).toMatchObject({
         lifecycleStatus: "inProgress",
